@@ -10,6 +10,11 @@ export const ROOTS = [
   { dir: path.join(HOME, ".claude/skills"), source: "active" },
   { dir: path.join(HOME, ".claude/plugins"), source: "plugin" },
   { dir: path.join(HOME, ".claude/skill-vault"), source: "vault" },
+  // local patch: extra roots (colon-separated) ranked like vault, e.g. ~/.agents/skills shared with opencode/dsh
+  ...(process.env.SKILL_ROUTER_EXTRA_ROOTS ?? "")
+    .split(":")
+    .filter(Boolean)
+    .map((d) => ({ dir: d.replace(/^~(?=\/|$)/, HOME), source: "vault" })),
 ];
 export const SOURCE_RANK = { active: 0, plugin: 1, vault: 2 };
 export const BODY_SCORE_CHARS = 8000;
@@ -22,7 +27,13 @@ export function slugify(name) {
 }
 
 export function tokens(text) {
-  return new Set((text.match(/\w+/g) ?? []).map((t) => t.toLowerCase()));
+  const out = new Set((text.match(/\w+/g) ?? []).map((t) => t.toLowerCase()));
+  // local patch: CJK has no spaces, so index overlapping bigrams (飞书日程 -> 飞书,书日,日程)
+  for (const run of text.match(/[\u3400-\u9fff]+/g) ?? []) {
+    if (run.length === 1) out.add(run);
+    for (let i = 0; i + 1 < run.length; i++) out.add(run.slice(i, i + 2));
+  }
+  return out;
 }
 
 // Filler words weak/terse callers pad queries with ("make my website load
@@ -34,10 +45,34 @@ const STOPWORDS = new Set([
   "does", "can", "want", "need", "help", "please", "make", "get", "set", "up",
   "use", "using", "when", "what", "which", "some", "more", "so", "at", "be",
 ]);
+// Brand/product aliases: callers write "feishu calendar", the skill is named
+// lark-calendar; without expansion the domain term can never match a name.
+const SYNONYMS = {
+  feishu: ["lark"],
+  lark: ["feishu"],
+  "飞书": ["lark"],
+  k8s: ["kubernetes"],
+  kubernetes: ["k8s"],
+  js: ["javascript"],
+  ts: ["typescript"],
+  py: ["python"],
+  ppt: ["pptx", "slides", "deck"],
+  slides: ["pptx", "deck"],
+  deck: ["pptx", "slides"],
+  cve: ["vulnerability"],
+  sec: ["security"],
+  rag: ["retrieval"],
+  db: ["database"],
+  pg: ["postgres"],
+};
+
 export function queryTokens(text) {
   const all = tokens(text);
   const filtered = new Set([...all].filter((t) => !STOPWORDS.has(t) && t.length > 1));
-  return filtered.size > 0 ? filtered : all;
+  const base = filtered.size > 0 ? filtered : all;
+  const out = new Set(base);
+  for (const t of base) for (const alias of SYNONYMS[t] ?? []) out.add(alias);
+  return out;
 }
 
 // Parses `key: value` out of a `---\n...\n---` frontmatter block, including
@@ -116,6 +151,17 @@ export function isExcludedPluginPath(p) {
   return p.includes("/plugins/cache/") || p.includes("/plugins/marketplaces/");
 }
 
+// Vendored repos ship their own test fixtures and node_modules; indexing those
+// fake SKILL.md files pollutes results with ids nobody can use.
+export function isExcludedJunkPath(p) {
+  return (
+    p.includes("/evals/fixtures/") ||
+    p.includes("/tests/fixtures/") ||
+    p.includes("/node_modules/") ||
+    p.includes("/.git/")
+  );
+}
+
 export async function loadSkill(filePath, source) {
   let raw;
   try {
@@ -139,6 +185,7 @@ export async function loadSkill(filePath, source) {
 }
 
 let index = new Map(); // id -> skill item (winner), with shadowedBy: string[]
+let df = new Map(); // token -> document frequency, for idf()
 
 export function getIndex() {
   return index;
@@ -148,7 +195,7 @@ export async function buildIndex() {
   const counts = { active: 0, plugin: 0, vault: 0, shadowed: 0 };
   const byId = new Map();
   for (const { dir, source } of ROOTS) {
-    const exclude = source === "plugin" ? isExcludedPluginPath : undefined;
+    const exclude = (p) => isExcludedJunkPath(p) || (source === "plugin" && isExcludedPluginPath(p));
     const files = await findSkillFiles(dir, exclude);
     for (const file of files) {
       const item = await loadSkill(file, source);
@@ -172,17 +219,32 @@ export async function buildIndex() {
     }
   }
   index = byId;
+  // Precompute the scoring haystack once per item: re-tokenizing up to 8KB of
+  // body on every query was the dominant search cost (~380ms p50 before).
+  df = new Map();
+  for (const item of byId.values()) {
+    const hay = [item.name, item.description, item.bodyForScoring].join("\n").toLowerCase();
+    item.haystackText = hay;
+    item.haystackTokens = tokens(hay);
+    for (const t of item.haystackTokens) df.set(t, (df.get(t) ?? 0) + 1);
+  }
   return counts;
 }
 
+// Rarer tokens carry more signal: without idf, "audit"/"design" outvote the one
+// domain term that actually identifies the skill.
+function idf(t) {
+  const n = df.get(t) ?? 0;
+  if (!n) return 0;
+  return Math.log(1 + (index.size - n + 0.5) / (n + 0.5));
+}
+
 export function scoreItem(item, qTokens, queryText) {
-  const haystackText = [item.name, item.description, item.bodyForScoring]
-    .join("\n")
-    .toLowerCase();
-  const haystackTokens = tokens(haystackText);
-  let overlap = 0;
-  for (const t of qTokens) if (haystackTokens.has(t)) overlap++;
-  let score = overlap;
+  const haystackText =
+    item.haystackText ?? [item.name, item.description, item.bodyForScoring].join("\n").toLowerCase();
+  const haystackTokens = item.haystackTokens ?? tokens(haystackText);
+  let score = 0;
+  for (const t of qTokens) if (haystackTokens.has(t)) score += 1 + idf(t);
   if (queryText && haystackText.includes(queryText)) score += 5;
   const nameLower = item.name.toLowerCase();
   const descLower = item.description.toLowerCase();
